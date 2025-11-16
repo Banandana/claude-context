@@ -79,12 +79,14 @@ export class ToolHandlers {
 
                     if (results && results.length > 0) {
                         const firstResult = results[0];
-                        const metadataStr = firstResult.metadata;
+                        const metadata = firstResult.metadata;
 
-                        if (metadataStr) {
+                        if (metadata) {
                             try {
-                                const metadata = JSON.parse(metadataStr);
-                                const codebasePath = metadata.codebasePath;
+                                // Metadata is already an object, not a string
+                                const codebasePath = typeof metadata === 'string'
+                                    ? JSON.parse(metadata).codebasePath
+                                    : metadata.codebasePath;
 
                                 if (codebasePath && typeof codebasePath === 'string') {
                                     console.log(`[SYNC-CLOUD] 📍 Found codebase path: ${codebasePath} in collection: ${collectionName}`);
@@ -93,7 +95,7 @@ export class ToolHandlers {
                                     console.warn(`[SYNC-CLOUD] ⚠️  No codebasePath found in metadata for collection: ${collectionName}`);
                                 }
                             } catch (parseError) {
-                                console.warn(`[SYNC-CLOUD] ⚠️  Failed to parse metadata JSON for collection ${collectionName}:`, parseError);
+                                console.warn(`[SYNC-CLOUD] ⚠️  Failed to parse metadata for collection ${collectionName}:`, parseError);
                             }
                         } else {
                             console.warn(`[SYNC-CLOUD] ⚠️  No metadata found in collection: ${collectionName}`);

@@ -115,9 +115,10 @@ export class QdrantVectorDatabase implements VectorDatabase {
 
     try {
       const points = documents.map((doc) => ({
-        id: doc.id,
+        id: this.stringToUUID(doc.id),
         vector: doc.vector,
         payload: {
+          originalId: doc.id, // Store original ID in payload for reference
           content: doc.content,
           relativePath: doc.relativePath,
           startLine: doc.startLine,
@@ -141,15 +142,16 @@ export class QdrantVectorDatabase implements VectorDatabase {
 
     try {
       const points = documents.map((doc) => ({
-        id: doc.id,
-        vector: doc.vector,
-        sparse_vectors: {
+        id: this.stringToUUID(doc.id),
+        vector: doc.vector, // Unnamed default dense vector
+        sparse_vector: { // Note: singular form for Qdrant API compatibility
           text: {
             indices: this.tokenizeToIndices(doc.content),
             values: this.tokenizeToValues(doc.content),
           },
         },
         payload: {
+          originalId: doc.id, // Store original ID in payload for reference
           content: doc.content,
           relativePath: doc.relativePath,
           startLine: doc.startLine,
@@ -186,7 +188,7 @@ export class QdrantVectorDatabase implements VectorDatabase {
 
       return response.map((point: any) => ({
         document: {
-          id: point.id as string,
+          id: (point.payload?.originalId || point.id) as string, // Use original ID from payload
           vector: queryVector,
           content: (point.payload?.content || '') as string,
           relativePath: (point.payload?.relativePath || '') as string,
@@ -218,52 +220,94 @@ export class QdrantVectorDatabase implements VectorDatabase {
         throw new Error('Dense search request (vector) is required for hybrid search');
       }
 
-      // Perform dense vector search with prefetch for sparse search
       const denseVector = denseRequest.data as number[];
       const sparseText = sparseRequest?.data as string | undefined;
 
-      const response = await this.client.searchPointGroups(collectionName, {
+      // Perform dense vector search
+      const denseResults = await this.client.search(collectionName, {
         vector: denseVector,
-        limit,
+        limit: limit * 2, // Get more results for better fusion
         with_payload: true,
-        group_by: 'id',
-        group_size: limit,
-        ...(sparseText && {
-          prefetch: [
-            {
-              vector: this.tokenizeToVector(sparseText),
-              using: 'text',
-              limit,
-            },
-          ],
-        }),
       });
 
-      // Extract points from group response
-      const allPoints: any[] = [];
-      if ('groups' in response && Array.isArray(response.groups)) {
-        response.groups.forEach((group) => {
-          if (group.hits && Array.isArray(group.hits)) {
-            allPoints.push(...group.hits);
+      let allResults: Map<string, { point: any; denseRank?: number; sparseRank?: number }> = new Map();
+
+      // Add dense results with rankings
+      denseResults.forEach((result, index) => {
+        const id = result.id as string;
+        allResults.set(id, {
+          point: result,
+          denseRank: index + 1,
+        });
+      });
+
+      // Perform sparse vector search if sparse text is provided
+      if (sparseText) {
+        const sparseVector = this.tokenizeToVector(sparseText);
+        
+        // Search using sparse vector
+        const sparseResults = await this.client.search(collectionName, {
+          vector: {
+            name: 'text',
+            vector: sparseVector,
+          },
+          limit: limit * 2,
+          with_payload: true,
+        });
+
+        // Add sparse results with rankings
+        sparseResults.forEach((result, index) => {
+          const id = result.id as string;
+          const existing = allResults.get(id);
+          if (existing) {
+            existing.sparseRank = index + 1;
+          } else {
+            allResults.set(id, {
+              point: result,
+              sparseRank: index + 1,
+            });
           }
         });
       }
 
-      // Apply RRF reranking if specified
-      const results = this.applyRerankingIfNeeded(allPoints, options?.rerank);
+      // Apply RRF (Reciprocal Rank Fusion) scoring
+      const k = options?.rerank?.params?.k || 60;
+      const scoredResults = Array.from(allResults.values()).map((item) => {
+        let rrfScore = 0;
+        
+        // Add dense contribution
+        if (item.denseRank !== undefined) {
+          rrfScore += 1 / (k + item.denseRank);
+        }
+        
+        // Add sparse contribution  
+        if (item.sparseRank !== undefined) {
+          rrfScore += 1 / (k + item.sparseRank);
+        }
 
-      return results.slice(0, limit).map((point) => ({
+        return {
+          point: item.point,
+          rrfScore,
+        };
+      });
+
+      // Sort by RRF score and take top results
+      scoredResults.sort((a, b) => b.rrfScore - a.rrfScore);
+      const topResults = scoredResults.slice(0, limit);
+
+      // Convert to HybridSearchResult format
+      return topResults.map((item) => ({
         document: {
-          id: point.id as string,
+          id: (item.point.payload?.originalId || item.point.id) as string,
           vector: denseVector,
-          content: point.payload?.content || '',
-          relativePath: point.payload?.relativePath || '',
-          startLine: point.payload?.startLine || 0,
-          endLine: point.payload?.endLine || 0,
-          fileExtension: point.payload?.fileExtension || '',
-          metadata: point.payload?.metadata || {},
+          content: item.point.payload?.content || '',
+          relativePath: item.point.payload?.relativePath || '',
+          startLine: item.point.payload?.startLine || 0,
+          endLine: item.point.payload?.endLine || 0,
+          fileExtension: item.point.payload?.fileExtension || '',
+          metadata: item.point.payload?.metadata || {},
         },
-        score: point.score,
+        score: item.rrfScore, // Use RRF score
       }));
     } catch (error) {
       throw new Error(`Failed to perform hybrid search in ${collectionName}: ${error}`);
@@ -275,14 +319,11 @@ export class QdrantVectorDatabase implements VectorDatabase {
     if (ids.length === 0) return;
 
     try {
-      // Convert string IDs to numbers if they are numeric
-      const pointIds = ids.map((id) => {
-        const num = parseInt(id, 10);
-        return isNaN(num) ? id : num;
-      });
+      // Convert string IDs to UUIDs
+      const pointIds = ids.map((id) => this.stringToUUID(id));
 
       await this.client.delete(collectionName, {
-        points: pointIds as (string | number)[],
+        points: pointIds,
       });
     } catch (error) {
       throw new Error(`Failed to delete documents from ${collectionName}: ${error}`);
@@ -345,6 +386,7 @@ export class QdrantVectorDatabase implements VectorDatabase {
   // Helper method to tokenize text into sparse vector values
   private tokenizeToValues(text: string): number[] {
     const tokens = this.tokenize(text);
+    const indices = this.tokenizeToIndices(text); // Get indices in correct order
     const tokenMap = new Map<number, number>();
 
     tokens.forEach((token) => {
@@ -352,7 +394,8 @@ export class QdrantVectorDatabase implements VectorDatabase {
       tokenMap.set(index, (tokenMap.get(index) || 0) + 1);
     });
 
-    return Array.from(tokenMap.values());
+    // Return values in the same order as indices
+    return indices.map(index => tokenMap.get(index) || 0);
   }
 
   // Helper method to tokenize text for BM25
@@ -375,12 +418,22 @@ export class QdrantVectorDatabase implements VectorDatabase {
     return Math.abs(hash) % 65536; // Keep index within reasonable range
   }
 
+  // Helper method to convert string ID to UUID format for Qdrant
+  // Qdrant requires point IDs to be either UUIDs or unsigned integers
+  private stringToUUID(id: string): string {
+    const crypto = require('crypto');
+    // Create a consistent hash from the ID
+    const hash = crypto.createHash('md5').update(id).digest('hex');
+    // Format as UUID v4: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+    return `${hash.substring(0, 8)}-${hash.substring(8, 12)}-4${hash.substring(13, 16)}-${hash.substring(16, 20)}-${hash.substring(20, 32)}`;
+  }
+
   // Convert text to sparse vector for searching
-  private tokenizeToVector(text: string): number[] {
+  private tokenizeToVector(text: string): { indices: number[]; values: number[] } {
     const indices = this.tokenizeToIndices(text);
     const values = this.tokenizeToValues(text);
-    // Return sparse vector as dense for API compatibility
-    return indices.slice(0, 100); // Limit to top 100 tokens
+    // Return sparse vector in proper Qdrant format
+    return { indices, values };
   }
 
   // Apply RRF (Reciprocal Rank Fusion) or weighted reranking
