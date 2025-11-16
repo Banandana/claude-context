@@ -16,8 +16,11 @@ export interface ContextMcpConfig {
     ollamaModel?: string;
     ollamaHost?: string;
     // Vector database configuration
+    vectorDbType?: 'milvus' | 'qdrant'; // NEW
     milvusAddress?: string; // Optional, can be auto-resolved from token
     milvusToken?: string;
+    qdrantUrl?: string; // NEW
+    qdrantApiKey?: string; // NEW
 }
 
 // Legacy format (v1) - for backward compatibility
@@ -102,6 +105,27 @@ export function getEmbeddingModelForProvider(provider: string): string {
     }
 }
 
+// Helper function to normalize embedding provider name to correct case
+function normalizeEmbeddingProvider(provider: string | undefined): 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama' {
+    if (!provider) return 'OpenAI';
+    
+    const normalized = provider.toLowerCase();
+    switch (normalized) {
+        case 'openai':
+            return 'OpenAI';
+        case 'voyageai':
+        case 'voyage':
+            return 'VoyageAI';
+        case 'gemini':
+            return 'Gemini';
+        case 'ollama':
+            return 'Ollama';
+        default:
+            console.warn(`[CONFIG] Unknown embedding provider '${provider}', defaulting to OpenAI`);
+            return 'OpenAI';
+    }
+}
+
 export function createMcpConfig(): ContextMcpConfig {
     // Debug: Print all environment variables related to Context
     console.log(`[DEBUG] 🔍 Environment Variables Debug:`);
@@ -110,15 +134,19 @@ export function createMcpConfig(): ContextMcpConfig {
     console.log(`[DEBUG]   OLLAMA_MODEL: ${envManager.get('OLLAMA_MODEL') || 'NOT SET'}`);
     console.log(`[DEBUG]   GEMINI_API_KEY: ${envManager.get('GEMINI_API_KEY') ? 'SET (length: ' + envManager.get('GEMINI_API_KEY')!.length + ')' : 'NOT SET'}`);
     console.log(`[DEBUG]   OPENAI_API_KEY: ${envManager.get('OPENAI_API_KEY') ? 'SET (length: ' + envManager.get('OPENAI_API_KEY')!.length + ')' : 'NOT SET'}`);
+    console.log(`[DEBUG]   VECTOR_DB_TYPE: ${envManager.get('VECTOR_DB_TYPE') || 'NOT SET'}`);
     console.log(`[DEBUG]   MILVUS_ADDRESS: ${envManager.get('MILVUS_ADDRESS') || 'NOT SET'}`);
+    console.log(`[DEBUG]   QDRANT_URL: ${envManager.get('QDRANT_URL') || 'NOT SET'}`);
     console.log(`[DEBUG]   NODE_ENV: ${envManager.get('NODE_ENV') || 'NOT SET'}`);
+
+    const normalizedProvider = normalizeEmbeddingProvider(envManager.get('EMBEDDING_PROVIDER'));
 
     const config: ContextMcpConfig = {
         name: envManager.get('MCP_SERVER_NAME') || "Context MCP Server",
         version: envManager.get('MCP_SERVER_VERSION') || "1.0.0",
         // Embedding provider configuration
-        embeddingProvider: (envManager.get('EMBEDDING_PROVIDER') as 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama') || 'OpenAI',
-        embeddingModel: getEmbeddingModelForProvider(envManager.get('EMBEDDING_PROVIDER') || 'OpenAI'),
+        embeddingProvider: normalizedProvider,
+        embeddingModel: getEmbeddingModelForProvider(normalizedProvider),
         // Provider-specific API keys
         openaiApiKey: envManager.get('OPENAI_API_KEY'),
         openaiBaseUrl: envManager.get('OPENAI_BASE_URL'),
@@ -128,9 +156,12 @@ export function createMcpConfig(): ContextMcpConfig {
         // Ollama configuration
         ollamaModel: envManager.get('OLLAMA_MODEL'),
         ollamaHost: envManager.get('OLLAMA_HOST'),
-        // Vector database configuration - address can be auto-resolved from token
+        // Vector database configuration
+        vectorDbType: (envManager.get('VECTOR_DB_TYPE') as 'milvus' | 'qdrant') || 'milvus',
         milvusAddress: envManager.get('MILVUS_ADDRESS'), // Optional, can be resolved from token
-        milvusToken: envManager.get('MILVUS_TOKEN')
+        milvusToken: envManager.get('MILVUS_TOKEN'),
+        qdrantUrl: envManager.get('QDRANT_URL') || 'http://localhost:6333',
+        qdrantApiKey: envManager.get('QDRANT_API_KEY')
     };
 
     return config;
@@ -143,7 +174,12 @@ export function logConfigurationSummary(config: ContextMcpConfig): void {
     console.log(`[MCP]   Server: ${config.name} v${config.version}`);
     console.log(`[MCP]   Embedding Provider: ${config.embeddingProvider}`);
     console.log(`[MCP]   Embedding Model: ${config.embeddingModel}`);
-    console.log(`[MCP]   Milvus Address: ${config.milvusAddress || (config.milvusToken ? '[Auto-resolve from token]' : '[Not configured]')}`);
+    console.log(`[MCP]   Vector DB Type: ${config.vectorDbType || 'milvus'}`);
+    if (config.vectorDbType === 'qdrant') {
+        console.log(`[MCP]   Qdrant URL: ${config.qdrantUrl || 'http://localhost:6333'}`);
+    } else {
+        console.log(`[MCP]   Milvus Address: ${config.milvusAddress || (config.milvusToken ? '[Auto-resolve from token]' : '[Not configured]')}`);
+    }
 
     // Log provider-specific configuration without exposing sensitive data
     switch (config.embeddingProvider) {
@@ -200,8 +236,11 @@ Environment Variables:
   OLLAMA_MODEL            Ollama model name (alternative to EMBEDDING_MODEL for Ollama)
   
   Vector Database Configuration:
+  VECTOR_DB_TYPE          Vector database type: milvus or qdrant (default: milvus)
   MILVUS_ADDRESS          Milvus address (optional, can be auto-resolved from token)
   MILVUS_TOKEN            Milvus token (optional, used for authentication and address resolution)
+  QDRANT_URL              Qdrant server URL (default: http://localhost:6333)
+  QDRANT_API_KEY          Qdrant API key (optional, for Qdrant Cloud authentication)
 
 Examples:
   # Start MCP server with OpenAI (default) and explicit Milvus address
@@ -221,5 +260,11 @@ Examples:
   
   # Start MCP server with Ollama and specific model (using EMBEDDING_MODEL)
   EMBEDDING_PROVIDER=Ollama EMBEDDING_MODEL=nomic-embed-text MILVUS_TOKEN=your-token npx @zilliz/claude-context-mcp@latest
+
+  # Start MCP server with Qdrant (self-hosted)
+  VECTOR_DB_TYPE=qdrant QDRANT_URL=http://localhost:6333 OPENAI_API_KEY=sk-xxx npx @zilliz/claude-context-mcp@latest
+
+  # Start MCP server with Qdrant Cloud
+  VECTOR_DB_TYPE=qdrant QDRANT_URL=https://your-cluster.qdrant.io QDRANT_API_KEY=your-api-key OPENAI_API_KEY=sk-xxx npx @zilliz/claude-context-mcp@latest
         `);
 } 
